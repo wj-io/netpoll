@@ -117,6 +117,34 @@ func (b *SafeLinkBuffer) MallocLen() (length int) {
 	return b.UnsafeLinkBuffer.MallocLen()
 }
 
+// GetReadByteOffset returns the read cursor as a byte offset from head.
+func (b *SafeLinkBuffer) GetReadByteOffset() int {
+	b.Lock()
+	defer b.Unlock()
+	return b.UnsafeLinkBuffer.GetReadByteOffset()
+}
+
+// SetReadByteOffset seeks the read cursor by offset from head.
+func (b *SafeLinkBuffer) SetReadByteOffset(g int) error {
+	b.Lock()
+	defer b.Unlock()
+	return b.UnsafeLinkBuffer.SetReadByteOffset(g)
+}
+
+// GetWriteByteOffset returns the pending malloc size.
+func (b *SafeLinkBuffer) GetWriteByteOffset() int {
+	b.Lock()
+	defer b.Unlock()
+	return b.UnsafeLinkBuffer.GetWriteByteOffset()
+}
+
+// SetWriteByteOffset sets pending malloc size (truncate, no-op, or grow with zeros).
+func (b *SafeLinkBuffer) SetWriteByteOffset(n int) error {
+	b.Lock()
+	defer b.Unlock()
+	return b.UnsafeLinkBuffer.SetWriteByteOffset(n)
+}
+
 // MallocAck implements Writer.
 func (b *SafeLinkBuffer) MallocAck(n int) (err error) {
 	b.Lock()

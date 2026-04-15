@@ -34,6 +34,8 @@ var LinkBufferCap = block4k
 
 var untilErr = errors.New("link buffer read slice cannot find delim")
 
+var errLinkBufferClosed = errors.New("link buffer is closed")
+
 var (
 	_ Reader = &LinkBuffer{}
 	_ Writer = &LinkBuffer{}
@@ -78,6 +80,161 @@ func (b *UnsafeLinkBuffer) Len() int {
 // IsEmpty check if this LinkBuffer is empty.
 func (b *UnsafeLinkBuffer) IsEmpty() (ok bool) {
 	return b.Len() == 0
+}
+
+// linkBufNormalizeRead returns the first node at or after read that has data,
+// or flush when read has caught up to flush on an empty tail.
+func linkBufNormalizeRead(read, flush *linkBufferNode) *linkBufferNode {
+	if read == nil {
+		return nil
+	}
+	for read != flush && read.Len() == 0 && read.next != nil {
+		read = read.next
+	}
+	return read
+}
+
+// readByteOffsetUpperBound returns one past the last byte index addressable on
+// the read path from head through flush (each node counts len(buf), including
+// the flush node).
+func (b *UnsafeLinkBuffer) readByteOffsetUpperBound() int {
+	if b.head == nil {
+		return 0
+	}
+	sum := 0
+	for cur := b.head; cur != nil; cur = cur.next {
+		sum += len(cur.buf)
+		if cur == b.flush {
+			break
+		}
+	}
+	return sum
+}
+
+// GetReadByteOffset returns the read cursor as a byte offset from head,
+// counting len(buf) per node up to the read position (see SetReadByteOffset).
+func (b *UnsafeLinkBuffer) GetReadByteOffset() int {
+	if b.head == nil {
+		return 0
+	}
+	r := linkBufNormalizeRead(b.read, b.flush)
+	if r == nil {
+		return 0
+	}
+	sum := 0
+	for cur := b.head; cur != nil; cur = cur.next {
+		if cur == r {
+			return sum + r.off
+		}
+		sum += len(cur.buf)
+	}
+	return 0
+}
+
+// SetReadByteOffset seeks the read cursor by walking from head and locating
+// the node for the given offset. It updates Len and clears peek cache.
+func (b *UnsafeLinkBuffer) SetReadByteOffset(g int) error {
+	if b.head == nil {
+		return errLinkBufferClosed
+	}
+	if g < 0 {
+		return fmt.Errorf("link buffer read offset: negative")
+	}
+	if maxG := b.readByteOffsetUpperBound(); g > maxG {
+		return fmt.Errorf("link buffer read offset: beyond flush")
+	}
+	oldLen := b.Len()
+	cum := 0
+	for cur := b.head; cur != nil; cur = cur.next {
+		lb := len(cur.buf)
+		if cur == b.flush {
+			b.read = cur
+			cur.off = g - cum
+			b.finishReadSeek(oldLen)
+			return nil
+		}
+		if g < cum+lb {
+			b.read = cur
+			cur.off = g - cum
+			b.finishReadSeek(oldLen)
+			return nil
+		}
+		if g == cum+lb {
+			next := cur.next
+			if next == nil {
+				return fmt.Errorf("link buffer read offset: invalid chain")
+			}
+			b.read = next
+			b.read.off = 0
+			b.finishReadSeek(oldLen)
+			return nil
+		}
+		cum += lb
+	}
+	return fmt.Errorf("link buffer read offset: flush not found")
+}
+
+func (b *UnsafeLinkBuffer) finishReadSeek(oldLen int) {
+	for b.read != b.flush && b.read.Len() == 0 && b.read.next != nil {
+		b.read = b.read.next
+	}
+	b.recalLen(b.readableBytesFrom(b.read, b.read.off) - oldLen)
+	b.cachePeek = b.cachePeek[:0]
+}
+
+// GetWriteByteOffset returns the pending malloc size (same as MallocLen):
+// the number of bytes from flush through the current malloc tail.
+func (b *UnsafeLinkBuffer) GetWriteByteOffset() int {
+	return b.mallocSize
+}
+
+// SetWriteByteOffset sets the pending malloc size to n bytes from flush.
+//   - n < mallocSize: truncates the tail (MallocAck).
+//   - n > mallocSize: grows with zero-filled bytes so the next logical write ends at n.
+//   - n == mallocSize: no-op.
+func (b *UnsafeLinkBuffer) SetWriteByteOffset(n int) error {
+	if b.head == nil {
+		return errLinkBufferClosed
+	}
+	if n < 0 {
+		return fmt.Errorf("link buffer write offset: negative")
+	}
+	if n == b.mallocSize {
+		return nil
+	}
+	if n < b.mallocSize {
+		return b.MallocAck(n)
+	}
+	delta := n - b.mallocSize
+	buf, err := b.Malloc(delta)
+	if err != nil {
+		return err
+	}
+	for i := range buf {
+		buf[i] = 0
+	}
+	return nil
+}
+
+// readableBytesFrom counts readable bytes from (node, off) up to b.flush
+// (exclusive of unflushed malloc past len(buf) on the flush node).
+func (b *UnsafeLinkBuffer) readableBytesFrom(node *linkBufferNode, off int) int {
+	flush := b.flush
+	if node == flush {
+		if off > len(flush.buf) {
+			return 0
+		}
+		return len(flush.buf) - off
+	}
+	sum := len(node.buf) - off
+	for cur := node.next; cur != flush; cur = cur.next {
+		if cur == nil {
+			return 0
+		}
+		sum += cur.Len()
+	}
+	sum += len(flush.buf) - flush.off
+	return sum
 }
 
 // ------------------------------------------ implement copy reader ------------------------------------------
@@ -457,6 +614,15 @@ func (b *UnsafeLinkBuffer) MallocAck(n int) (err error) {
 			break
 		}
 		b.write = b.write.next
+	}
+	// n==0 skips the loop above, but unflushed bytes may still live on b.flush
+	// (when flush == write or malloc starts on flush). Trim the whole tail chain.
+	if n == 0 {
+		for node := b.flush; node != nil; node = node.next {
+			if node.malloc > len(node.buf) {
+				node.malloc = len(node.buf)
+			}
+		}
 	}
 	// discard the rest
 	for node := b.write.next; node != nil; node = node.next {

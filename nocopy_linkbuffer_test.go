@@ -888,6 +888,64 @@ func BenchmarkStringToSliceByte(b *testing.B) {
 	_ = bs
 }
 
+func TestUnsafeLinkBufferReadWriteByteOffset(t *testing.T) {
+	buf := NewLinkBuffer()
+	MustNil(t, buf.SetReadByteOffset(buf.GetReadByteOffset()))
+
+	buf.WriteBinary([]byte("hello"))
+	MustNil(t, buf.Flush())
+	pos := buf.GetReadByteOffset()
+	MustNil(t, buf.Skip(3))
+	Equal(t, buf.Len(), 2)
+	MustNil(t, buf.SetReadByteOffset(pos))
+	Equal(t, buf.Len(), 5)
+	out, err := buf.ReadBinary(5)
+	MustNil(t, err)
+	Equal(t, string(out), "hello")
+
+	buf2 := NewLinkBuffer()
+	_, err = buf2.Malloc(4)
+	MustNil(t, err)
+	Equal(t, buf2.GetWriteByteOffset(), 4)
+	MustNil(t, buf2.SetWriteByteOffset(4))
+	_, err = buf2.Malloc(4)
+	MustNil(t, err)
+	Equal(t, buf2.GetWriteByteOffset(), 8)
+	MustNil(t, buf2.SetWriteByteOffset(4))
+	Equal(t, buf2.GetWriteByteOffset(), 4)
+
+	bufGrow := NewLinkBuffer()
+	MustNil(t, bufGrow.SetWriteByteOffset(16))
+	Equal(t, bufGrow.MallocLen(), 16)
+	MustNil(t, bufGrow.Flush())
+	Equal(t, bufGrow.Len(), 16)
+	z, err := bufGrow.Peek(16)
+	MustNil(t, err)
+	for i := range z {
+		if z[i] != 0 {
+			t.Fatalf("byte %d: got %d want 0", i, z[i])
+		}
+	}
+
+	buf3 := NewLinkBuffer()
+	MustNil(t, buf3.Close())
+	MustTrue(t, buf3.SetReadByteOffset(0) != nil)
+	MustTrue(t, buf3.SetWriteByteOffset(0) != nil)
+}
+
+// SetWriteByteOffset(0) must drop pending malloc so a later write replaces it
+// (MallocAck(0) used to leave malloc>len(buf) on the flush node).
+func TestSetWriteByteOffsetZeroThenRewriteInt(t *testing.T) {
+	buf := NewLinkBuffer()
+	MustNil(t, buf.WriteByte(123))
+	MustNil(t, buf.SetWriteByteOffset(0))
+	MustNil(t, buf.WriteByte(234))
+	MustNil(t, buf.Flush())
+	got, err := buf.ReadByte()
+	MustNil(t, err)
+	Equal(t, got, byte(234))
+}
+
 func BenchmarkStringToCopy(b *testing.B) {
 	b.StopTimer()
 	s := "hello world"
