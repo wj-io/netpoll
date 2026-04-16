@@ -138,7 +138,8 @@ func (b *SafeLinkBuffer) GetWriteByteOffset() int {
 	return b.UnsafeLinkBuffer.GetWriteByteOffset()
 }
 
-// SetWriteByteOffset sets pending malloc size (truncate, no-op, or grow with zeros).
+// SetWriteByteOffset sets the logical write offset (seek backward without clearing
+// preserved tail, no-op, grow with zeros or reattach preserved tail).
 func (b *SafeLinkBuffer) SetWriteByteOffset(n int) error {
 	b.Lock()
 	defer b.Unlock()

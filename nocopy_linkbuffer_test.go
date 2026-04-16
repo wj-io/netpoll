@@ -933,17 +933,66 @@ func TestUnsafeLinkBufferReadWriteByteOffset(t *testing.T) {
 	MustTrue(t, buf3.SetWriteByteOffset(0) != nil)
 }
 
+func TestSetWriteByteOffsetPreservesMultinodeTail(t *testing.T) {
+	buf := NewLinkBuffer(block4k)
+	p1, err := buf.Malloc(block4k - 8)
+	MustNil(t, err)
+	p2, err := buf.Malloc(108)
+	MustNil(t, err)
+	for i := range p1 {
+		p1[i] = byte(i % 251)
+	}
+	for i := range p2 {
+		p2[i] = byte((len(p1) + i) % 251)
+	}
+	chunk := len(p1) + len(p2)
+	mid := len(p1)
+	MustNil(t, buf.SetWriteByteOffset(mid))
+	Equal(t, buf.GetWriteByteOffset(), mid)
+	MustNil(t, buf.SetWriteByteOffset(chunk))
+	Equal(t, buf.GetWriteByteOffset(), chunk)
+	MustNil(t, buf.Flush())
+	out := buf.Bytes()
+	MustTrue(t, len(out) == chunk)
+	for i := range out {
+		Equal(t, out[i], byte(i%251))
+	}
+}
+
 // SetWriteByteOffset(0) must drop pending malloc so a later write replaces it
 // (MallocAck(0) used to leave malloc>len(buf) on the flush node).
+// Seeking back to offset 1 to rewrite the second byte must not clear the third
+// byte when restoring the write offset to 3.
 func TestSetWriteByteOffsetZeroThenRewriteInt(t *testing.T) {
-	buf := NewLinkBuffer()
-	MustNil(t, buf.WriteByte(123))
-	MustNil(t, buf.SetWriteByteOffset(0))
-	MustNil(t, buf.WriteByte(234))
-	MustNil(t, buf.Flush())
-	got, err := buf.ReadByte()
-	MustNil(t, err)
-	Equal(t, got, byte(234))
+	t.Run("seekZero", func(t *testing.T) {
+		buf := NewLinkBuffer()
+		MustNil(t, buf.WriteByte(123))
+		MustNil(t, buf.SetWriteByteOffset(0))
+		MustNil(t, buf.WriteByte(234))
+		MustNil(t, buf.Flush())
+		got, err := buf.ReadByte()
+		MustNil(t, err)
+		Equal(t, got, byte(234))
+	})
+	t.Run("seekOneRewriteSecondPreservesThird", func(t *testing.T) {
+		buf := NewLinkBuffer()
+		MustNil(t, buf.WriteByte(11))
+		MustNil(t, buf.WriteByte(123))
+		MustNil(t, buf.WriteByte(111))
+		MustNil(t, buf.SetWriteByteOffset(1))
+		MustNil(t, buf.WriteByte(234))
+		MustNil(t, buf.SetWriteByteOffset(3))
+		MustNil(t, buf.Flush())
+		got, err := buf.ReadByte()
+		MustNil(t, err)
+		Equal(t, got, byte(11))
+		got, err = buf.ReadByte()
+		MustNil(t, err)
+		Equal(t, got, byte(234))
+		got, err = buf.ReadByte()
+		MustNil(t, err)
+		Equal(t, got, byte(111))
+	})
 }
 
 func BenchmarkStringToCopy(b *testing.B) {

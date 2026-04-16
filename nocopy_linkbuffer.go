@@ -57,11 +57,21 @@ func NewLinkBuffer(size ...int) *LinkBuffer {
 type UnsafeLinkBuffer struct {
 	length     int64
 	mallocSize int
+	// mallocHiMark is the maximum logical malloc offset (from flush) that has ever
+	// held user-written data since the last Flush, without shrinking on
+	// SetWriteByteOffset backward seeks. Used so forward SetWriteByteOffset can
+	// extend into existing backing-store bytes without zeroing them.
+	mallocHiMark int
 
 	head  *linkBufferNode // release head
 	read  *linkBufferNode // read head
 	flush *linkBufferNode // malloc head
 	write *linkBufferNode // malloc tail
+
+	// mallocTailHold stores nodes detached by SetWriteByteOffset when seeking the
+	// write cursor backward, so already-written bytes are preserved until the
+	// cursor grows again (Malloc / SetWriteByteOffset) or the buffer is closed.
+	mallocTailHold *linkBufferNode
 
 	// buf allocated by Next when cross-package, which should be freed when release
 	caches [][]byte
@@ -188,9 +198,11 @@ func (b *UnsafeLinkBuffer) GetWriteByteOffset() int {
 	return b.mallocSize
 }
 
-// SetWriteByteOffset sets the pending malloc size to n bytes from flush.
-//   - n < mallocSize: truncates the tail (MallocAck).
-//   - n > mallocSize: grows with zero-filled bytes so the next logical write ends at n.
+// SetWriteByteOffset sets the logical write offset to n bytes from flush.
+//   - n < mallocSize: seeks the write cursor backward without discarding bytes
+//     beyond n (they remain available if the offset grows again).
+//   - n > mallocSize: reattaches a detached tail when possible, then extends; only
+//     bytes beyond the high-water of prior writes in this malloc region are zero-filled.
 //   - n == mallocSize: no-op.
 func (b *UnsafeLinkBuffer) SetWriteByteOffset(n int) error {
 	if b.head == nil {
@@ -203,16 +215,46 @@ func (b *UnsafeLinkBuffer) SetWriteByteOffset(n int) error {
 		return nil
 	}
 	if n < b.mallocSize {
-		return b.MallocAck(n)
+		b.mallocAckSeekWrite(n)
+		b.detachWriteNextToMallocTailHold()
+		return nil
 	}
 	delta := n - b.mallocSize
-	buf, err := b.Malloc(delta)
+	recovered := 0
+	for delta > recovered && b.mallocTailHold != nil {
+		hl := mallocChainUnflushedLen(b.mallocTailHold)
+		if hl == 0 {
+			nd := b.mallocTailHold
+			b.mallocTailHold = nd.next
+			nd.next = nil
+			nd.Release()
+			continue
+		}
+		if hl <= delta-recovered {
+			recovered += b.reattachEntireMallocTailHold()
+			continue
+		}
+		b.releaseMallocTailHold()
+		break
+	}
+	need := delta - recovered
+	if need == 0 {
+		return nil
+	}
+	savedHi := b.mallocHiMark
+	base := b.mallocSize
+	buf, err := b.Malloc(need)
 	if err != nil {
 		return err
 	}
+	b.mallocHiMark = savedHi
 	for i := range buf {
+		if base+i < savedHi {
+			continue
+		}
 		buf[i] = 0
 	}
+	b.bumpMallocHiMark()
 	return nil
 }
 
@@ -583,6 +625,12 @@ func (b *UnsafeLinkBuffer) Slice(n int) (r Reader, err error) {
 
 // ------------------------------------------ implement zero-copy writer ------------------------------------------
 
+func (b *UnsafeLinkBuffer) bumpMallocHiMark() {
+	if b.mallocSize > b.mallocHiMark {
+		b.mallocHiMark = b.mallocSize
+	}
+}
+
 // Malloc pre-allocates memory, which is not readable, and becomes readable data after submission(e.g. Flush).
 func (b *UnsafeLinkBuffer) Malloc(n int) (buf []byte, err error) {
 	if n <= 0 {
@@ -590,7 +638,9 @@ func (b *UnsafeLinkBuffer) Malloc(n int) (buf []byte, err error) {
 	}
 	b.mallocSize += n
 	b.growth(n)
-	return b.write.Malloc(n), nil
+	p := b.write.Malloc(n)
+	b.bumpMallocHiMark()
+	return p, nil
 }
 
 // MallocLen implements Writer.
@@ -598,14 +648,19 @@ func (b *UnsafeLinkBuffer) MallocLen() (length int) {
 	return b.mallocSize
 }
 
-// MallocAck will keep the first n malloc bytes and discard the rest.
-func (b *UnsafeLinkBuffer) MallocAck(n int) (err error) {
-	if n < 0 {
-		return fmt.Errorf("link buffer malloc ack[%d] invalid", n)
+// mallocChainUnflushedLen sums (node.malloc - len(node.buf)) for a node chain.
+func mallocChainUnflushedLen(head *linkBufferNode) (sum int) {
+	for node := head; node != nil; node = node.next {
+		sum += node.malloc - len(node.buf)
 	}
+	return sum
+}
+
+// mallocAckSeekWrite positions b.write and b.mallocSize like MallocAck, but does
+// not discard or reset nodes after b.write.
+func (b *UnsafeLinkBuffer) mallocAckSeekWrite(n int) {
 	b.mallocSize = n
 	b.write = b.flush
-
 	var l int
 	for ack := n; ack > 0; ack = ack - l {
 		l = b.write.malloc - len(b.write.buf)
@@ -624,16 +679,82 @@ func (b *UnsafeLinkBuffer) MallocAck(n int) (err error) {
 			}
 		}
 	}
+}
+
+func (b *UnsafeLinkBuffer) concatMallocTailHold(tail *linkBufferNode) {
+	if tail == nil {
+		return
+	}
+	if b.mallocTailHold == nil {
+		b.mallocTailHold = tail
+		return
+	}
+	last := b.mallocTailHold
+	for last.next != nil {
+		last = last.next
+	}
+	last.next = tail
+}
+
+func (b *UnsafeLinkBuffer) detachWriteNextToMallocTailHold() {
+	tail := b.write.next
+	if tail == nil {
+		return
+	}
+	b.write.next = nil
+	b.concatMallocTailHold(tail)
+}
+
+func (b *UnsafeLinkBuffer) releaseMallocTailHold() {
+	for node := b.mallocTailHold; node != nil; {
+		nd := node
+		node = node.next
+		nd.next = nil
+		nd.Release()
+	}
+	b.mallocTailHold = nil
+}
+
+// reattachEntireMallocTailHold links b.mallocTailHold after the physical tail of
+// the active malloc chain, advances b.write to the new tail, and updates
+// b.mallocSize. b.mallocTailHold must be non-nil.
+func (b *UnsafeLinkBuffer) reattachEntireMallocTailHold() (added int) {
+	h := b.mallocTailHold
+	b.mallocTailHold = nil
+	added = mallocChainUnflushedLen(h)
+	tail := b.write
+	for tail.next != nil {
+		tail = tail.next
+	}
+	tail.next = h
+	for tail.next != nil {
+		tail = tail.next
+	}
+	b.write = tail
+	b.mallocSize += added
+	b.bumpMallocHiMark()
+	return added
+}
+
+// MallocAck will keep the first n malloc bytes and discard the rest.
+func (b *UnsafeLinkBuffer) MallocAck(n int) (err error) {
+	if n < 0 {
+		return fmt.Errorf("link buffer malloc ack[%d] invalid", n)
+	}
+	b.mallocAckSeekWrite(n)
+	b.releaseMallocTailHold()
 	// discard the rest
 	for node := b.write.next; node != nil; node = node.next {
 		node.malloc, node.refer, node.buf = node.off, 1, node.buf[:node.off]
 	}
+	b.mallocHiMark = n
 	return nil
 }
 
 // Flush will submit all malloc data and must confirm that the allocated bytes have been correctly assigned.
 func (b *UnsafeLinkBuffer) Flush() (err error) {
 	b.mallocSize = 0
+	b.mallocHiMark = 0
 	// FIXME: The tail node must not be larger than 8KB to prevent Out Of Memory.
 	if cap(b.write.buf) > pagesize {
 		b.write.next = newLinkBufferNode(0)
@@ -669,6 +790,7 @@ func (b *UnsafeLinkBuffer) WriteBuffer(buf *LinkBuffer) (err error) {
 	if buf == nil {
 		return
 	}
+	b.releaseMallocTailHold()
 	bufLen, bufMallocLen := buf.Len(), buf.MallocLen()
 	if bufLen+bufMallocLen <= 0 {
 		return nil
@@ -700,6 +822,7 @@ func (b *UnsafeLinkBuffer) WriteBuffer(buf *LinkBuffer) (err error) {
 		b.recalLen(bufLen)
 	}
 	b.mallocSize += bufMallocLen
+	b.bumpMallocHiMark()
 	return nil
 }
 
@@ -723,15 +846,19 @@ func (b *UnsafeLinkBuffer) WriteBinary(p []byte) (n int, err error) {
 	// TODO: Verify that all nocopy is possible under mcache.
 	if n > BinaryInplaceThreshold {
 		// expand buffer directly with nocopy
+		b.releaseMallocTailHold()
 		b.write.next = newLinkBufferNode(0)
 		b.write = b.write.next
 		b.write.buf, b.write.malloc = p[:0], n
+		b.bumpMallocHiMark()
 		return n, nil
 	}
 	// here will copy
 	b.growth(n)
 	buf := b.write.Malloc(n)
-	return copy(buf, p), nil
+	n = copy(buf, p)
+	b.bumpMallocHiMark()
+	return n, nil
 }
 
 // WriteDirect cannot be mixed with WriteString or WriteBinary functions.
@@ -740,6 +867,7 @@ func (b *UnsafeLinkBuffer) WriteDirect(extra []byte, remainLen int) error {
 	if n == 0 || remainLen < 0 {
 		return nil
 	}
+	b.releaseMallocTailHold()
 	// find origin
 	origin := b.flush
 	malloc := b.mallocSize - remainLen // calculate the remaining malloc length
@@ -785,6 +913,7 @@ func (b *UnsafeLinkBuffer) WriteDirect(extra []byte, remainLen int) error {
 	}
 
 	b.mallocSize += n
+	b.bumpMallocHiMark()
 	return nil
 }
 
@@ -801,6 +930,8 @@ func (b *UnsafeLinkBuffer) WriteByte(p byte) (err error) {
 func (b *UnsafeLinkBuffer) Close() (err error) {
 	atomic.StoreInt64(&b.length, 0)
 	b.mallocSize = 0
+	b.mallocHiMark = 0
+	b.releaseMallocTailHold()
 	// just release all
 	b.Release()
 	for node := b.head; node != nil; {
@@ -870,7 +1001,13 @@ func (b *UnsafeLinkBuffer) book(bookSize, maxSize int) (p []byte) {
 	// grow linkBuffer
 	if l == 0 {
 		l = maxSize
-		b.write.next = newLinkBufferNode(maxSize)
+		if b.write.next == nil && b.mallocTailHold != nil {
+			b.write.next = b.mallocTailHold
+			b.mallocTailHold = nil
+		}
+		if b.write.next == nil {
+			b.write.next = newLinkBufferNode(maxSize)
+		}
 		b.write = b.write.next
 	}
 	if l > bookSize {
@@ -908,6 +1045,7 @@ func (b *UnsafeLinkBuffer) resetTail(maxSize int) {
 		// no need to reset a small buffer tail node
 		return
 	}
+	b.releaseMallocTailHold()
 	// set nil tail
 	b.write.next = newLinkBufferNode(0)
 	b.write = b.write.next
@@ -965,6 +1103,10 @@ func (b *UnsafeLinkBuffer) growth(n int) {
 	}
 	// the memory of readonly node if not malloc by us so should skip them
 	for b.write.getFlag(flagUnmanaged) || cap(b.write.buf)-b.write.malloc < n {
+		if b.write.next == nil && b.mallocTailHold != nil {
+			b.write.next = b.mallocTailHold
+			b.mallocTailHold = nil
+		}
 		if b.write.next == nil {
 			b.write.next = newLinkBufferNode(n)
 			b.write = b.write.next
